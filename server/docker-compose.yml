@@ -1,0 +1,32 @@
+services:
+  unlimited-ocr:
+    # Use vllm/vllm-openai:unlimited-ocr-cu129 instead if running on H100/H200
+    image: vllm/vllm-openai:unlimited-ocr
+    container_name: unlimited-ocr-server
+    restart: unless-stopped
+    ipc: host
+    privileged: true
+    ports:
+      # Bind to a specific host IP (e.g. a Tailscale address) to restrict access.
+      # Replace with 0.0.0.0:8000:8000 to listen on all interfaces.
+      - "YOUR_HOST_IP:8000:8000"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      # Caches model weights on the host so they don't re-download on restart
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    command: >
+      baidu/Unlimited-OCR
+      --host 0.0.0.0
+      --port 8000
+      --trust-remote-code
+      --logits_processors vllm.model_executor.models.unlimited_ocr:NGramPerReqLogitsProcessor
+      --no-enable-prefix-caching
+      --mm-processor-cache-gb 0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

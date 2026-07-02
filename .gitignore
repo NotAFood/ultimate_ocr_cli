@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Generated OCR outputs (large embedded files)
+samples/*.html
+samples/*.md
+samples/*.pages.json
+
+# macOS
+.DS_Store
