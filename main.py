@@ -9,8 +9,8 @@ from pathlib import Path
 import pymupdf
 import requests
 
-SERVER_IP = "100.122.71.69"
-PORT = "8000"
+SERVER_IP = "localhost"
+PORT = "8001"
 API_URL = f"http://{SERVER_IP}:{PORT}/v1/chat/completions"
 
 
@@ -27,6 +27,17 @@ _BLOCK_RE = re.compile(
 # Heading-level heuristic based on common datasheet title patterns
 _CHAPTER_RE = re.compile(r"^(chapter\s+\d+|appendix)", re.IGNORECASE)
 _SECTION_RE = re.compile(r"^\d+\.\d+")
+
+# OCR emits LaTeX math wrapped in \( \) (inline) and \[ \] (display).
+# Convert to $ $ / $$ $$ for MathJax-based markdown readers.
+_DISPLAY_MATH_RE = re.compile(r"\\\[(.*?)\\\]", re.DOTALL)
+_INLINE_MATH_RE = re.compile(r"\\\((.*?)\\\)", re.DOTALL)
+
+
+def _convert_math_delimiters(text: str) -> str:
+    text = _DISPLAY_MATH_RE.sub(lambda m: f"$${m.group(1)}$$", text)
+    text = _INLINE_MATH_RE.sub(lambda m: f"${m.group(1)}$", text)
+    return text
 
 
 class _TableParser(HTMLParser):
@@ -95,6 +106,7 @@ def clean_ocr(raw: str) -> str:
         content = m.group(2).strip()
         if not content or label in _DROP_LABELS:
             continue
+        content = _convert_math_delimiters(content)
         if label == "title":
             level = _title_level(content)
             # collapse multi-line titles to single line
@@ -194,10 +206,22 @@ def process_image(image_path: Path) -> str | None:
 def main():
     parser = argparse.ArgumentParser(description="Baidu Unlimited-OCR wrapper")
     parser.add_argument("input", type=Path, help="PDF or image file to OCR")
-    parser.add_argument("-o", "--output", type=Path, help="Write output to file instead of stdout")
-    parser.add_argument("--dpi", type=int, default=150, help="DPI for PDF rendering (default: 150)")
-    parser.add_argument("--save-raw", action="store_true", help="Save per-page raw OCR to <output>.pages.json")
-    parser.add_argument("--gen-viz", action="store_true", help="Generate self-contained HTML visualizer at <output>.html (implies --save-raw)")
+    parser.add_argument(
+        "-o", "--output", type=Path, help="Write output to file instead of stdout"
+    )
+    parser.add_argument(
+        "--dpi", type=int, default=150, help="DPI for PDF rendering (default: 150)"
+    )
+    parser.add_argument(
+        "--save-raw",
+        action="store_true",
+        help="Save per-page raw OCR to <output>.pages.json",
+    )
+    parser.add_argument(
+        "--gen-viz",
+        action="store_true",
+        help="Generate self-contained HTML visualizer at <output>.html (implies --save-raw)",
+    )
     args = parser.parse_args()
 
     path: Path = args.input
@@ -211,17 +235,22 @@ def main():
         if (args.save_raw or args.gen_viz) and args.output:
             raw_path = args.output.with_suffix(".pages.json")
             raw_path.write_text(
-                json.dumps([{"page": i + 1, "raw": r} for i, r in enumerate(raw_pages)]),
+                json.dumps(
+                    [{"page": i + 1, "raw": r} for i, r in enumerate(raw_pages)]
+                ),
                 encoding="utf-8",
             )
             print(f"Raw OCR saved to {raw_path}")
         if args.gen_viz and args.output:
             from visualize import build_html
+
             pages_data = [{"page": i + 1, "raw": r} for i, r in enumerate(raw_pages)]
             html = build_html(pages_data, path)
             viz_path = args.output.with_suffix(".html")
             viz_path.write_text(html, encoding="utf-8")
-            print(f"Visualizer saved to {viz_path} ({viz_path.stat().st_size / 1_048_576:.1f} MB)")
+            print(
+                f"Visualizer saved to {viz_path} ({viz_path.stat().st_size / 1_048_576:.1f} MB)"
+            )
     elif suffix in {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}:
         print(f"OCR-ing {path.name}...")
         result = process_image(path)
