@@ -49,14 +49,19 @@ Output is clean markdown: headings, paragraphs, and GFM tables. Headers, footers
 
 ### Generate a bounding-box visualizer
 
-Pass `--save-raw` to preserve the model's raw output (needed for visualization):
+Add `--gen-viz` to produce a self-contained HTML viewer alongside the markdown:
 
 ```bash
-uv run python main.py document.pdf -o document.md --save-raw
-uv run python visualize.py document.pages.json document.pdf -o document.html
+uv run python main.py document.pdf -o document.md --gen-viz
 ```
 
-Open `document.html` in any browser. The file is fully self-contained — all page images and OCR data are embedded. Navigate pages with `←` `→` or the arrow keys; hover any box to see its block type and extracted content.
+This writes `document.md`, `document.pages.json` (raw OCR intermediate), and `document.html`. Open the HTML in any browser — all page images and OCR data are embedded. Navigate pages with `←` `→` or the arrow keys; hover any box to see its block type and extracted content.
+
+To regenerate the visualizer from an existing `.pages.json` without re-running OCR:
+
+```bash
+uv run python visualize.py document.pages.json document.pdf -o document.html
+```
 
 ### Options
 
@@ -65,5 +70,4 @@ Open `document.html` in any browser. The file is fully self-contained — all pa
 | `-o OUTPUT` | stdout | Write markdown output to file |
 | `--dpi DPI` | 150 | PDF render resolution (higher = better quality, slower) |
 | `--save-raw` | off | Save per-page raw OCR to `<output>.pages.json` |
-
-`visualize.py` also accepts `--dpi` (default 120) to control the resolution of embedded page images in the HTML.
+| `--gen-viz` | off | Generate HTML visualizer at `<output>.html` (implies `--save-raw`) |

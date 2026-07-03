@@ -1,5 +1,6 @@
 import argparse
 import base64
+import json
 import re
 import sys
 from html.parser import HTMLParser
@@ -161,7 +162,8 @@ def pdf_to_pages(pdf_path: Path, dpi: int = 150) -> list[bytes]:
     return pages
 
 
-def process_pdf(pdf_path: Path, dpi: int = 150, save_raw_to: Path | None = None) -> str:
+def process_pdf(pdf_path: Path, dpi: int = 150) -> tuple[str, list[str]]:
+    """Return (cleaned_markdown, raw_pages) where raw_pages is one string per page."""
     print(f"Converting {pdf_path.name} to images at {dpi} DPI...")
     pages = pdf_to_pages(pdf_path, dpi=dpi)
     n = len(pages)
@@ -179,15 +181,7 @@ def process_pdf(pdf_path: Path, dpi: int = 150, save_raw_to: Path | None = None)
             raw_pages.append("")
             print("failed")
 
-    if save_raw_to is not None:
-        import json
-        save_raw_to.write_text(
-            json.dumps([{"page": i + 1, "raw": r} for i, r in enumerate(raw_pages)]),
-            encoding="utf-8",
-        )
-        print(f"Raw OCR saved to {save_raw_to}")
-
-    return clean_ocr("\n\n".join(raw_pages))
+    return clean_ocr("\n\n".join(raw_pages)), raw_pages
 
 
 def process_image(image_path: Path) -> str | None:
@@ -202,7 +196,8 @@ def main():
     parser.add_argument("input", type=Path, help="PDF or image file to OCR")
     parser.add_argument("-o", "--output", type=Path, help="Write output to file instead of stdout")
     parser.add_argument("--dpi", type=int, default=150, help="DPI for PDF rendering (default: 150)")
-    parser.add_argument("--save-raw", action="store_true", help="Save per-page raw OCR to <output>.pages.json (required for visualize.py)")
+    parser.add_argument("--save-raw", action="store_true", help="Save per-page raw OCR to <output>.pages.json")
+    parser.add_argument("--gen-viz", action="store_true", help="Generate self-contained HTML visualizer at <output>.html (implies --save-raw)")
     args = parser.parse_args()
 
     path: Path = args.input
@@ -212,8 +207,21 @@ def main():
 
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        raw_path = args.output.with_suffix(".pages.json") if args.save_raw and args.output else None
-        result = process_pdf(path, dpi=args.dpi, save_raw_to=raw_path)
+        result, raw_pages = process_pdf(path, dpi=args.dpi)
+        if (args.save_raw or args.gen_viz) and args.output:
+            raw_path = args.output.with_suffix(".pages.json")
+            raw_path.write_text(
+                json.dumps([{"page": i + 1, "raw": r} for i, r in enumerate(raw_pages)]),
+                encoding="utf-8",
+            )
+            print(f"Raw OCR saved to {raw_path}")
+        if args.gen_viz and args.output:
+            from visualize import build_html
+            pages_data = [{"page": i + 1, "raw": r} for i, r in enumerate(raw_pages)]
+            html = build_html(pages_data, path)
+            viz_path = args.output.with_suffix(".html")
+            viz_path.write_text(html, encoding="utf-8")
+            print(f"Visualizer saved to {viz_path} ({viz_path.stat().st_size / 1_048_576:.1f} MB)")
     elif suffix in {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}:
         print(f"OCR-ing {path.name}...")
         result = process_image(path)
