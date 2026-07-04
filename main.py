@@ -148,7 +148,10 @@ def encode_image_bytes(image_bytes: bytes) -> str:
 
 
 def query_ocr(
-    base64_image: str, multi_page: bool = False, api_url: str = API_URL
+    base64_image: str,
+    multi_page: bool = False,
+    api_url: str = API_URL,
+    idle_timeout: float = 180,
 ) -> str | None:
     window_size = 1024 if multi_page else 128
     payload = {
@@ -168,6 +171,7 @@ def query_ocr(
         "temperature": 0,
         "max_tokens": 4096,
         "skip_special_tokens": False,
+        "stream": True,
         "extra_body": {
             "custom_params": {
                 "ngram_size": 35,
@@ -176,12 +180,26 @@ def query_ocr(
         },
     }
 
-    response = requests.post(api_url, json=payload, timeout=300)
-    if response.status_code == 200:
-        return response.json()["choices"][0]["message"]["content"]
-    else:
+    # timeout=(connect, read) — read is measured between chunks, not over the
+    # whole request, so a slow page keeps resetting it as tokens stream in.
+    response = requests.post(
+        api_url, json=payload, timeout=(10, idle_timeout), stream=True
+    )
+    if response.status_code != 200:
         print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
         return None
+
+    parts = []
+    for line in response.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data: "):
+            continue
+        data = line[len("data: ") :]
+        if data == "[DONE]":
+            break
+        delta = json.loads(data)["choices"][0]["delta"].get("content")
+        if delta:
+            parts.append(delta)
+    return "".join(parts)
 
 
 def process_pdf(
@@ -189,6 +207,7 @@ def process_pdf(
     dpi: int = 150,
     api_url: str = API_URL,
     workers: int = WORKERS,
+    idle_timeout: float = 180,
 ) -> tuple[str, list[str]]:
     """Return (cleaned_markdown, raw_pages) where raw_pages is one string per page.
 
@@ -212,7 +231,15 @@ def process_pdf(
             print(f"  page {i}/{n} rendering...", flush=True)
             page_bytes = page.get_pixmap(matrix=mat).tobytes("jpeg")
             b64 = encode_image_bytes(page_bytes)
-            futures[pool.submit(query_ocr, b64, multi_page=(n > 1), api_url=api_url)] = i
+            futures[
+                pool.submit(
+                    query_ocr,
+                    b64,
+                    multi_page=(n > 1),
+                    api_url=api_url,
+                    idle_timeout=idle_timeout,
+                )
+            ] = i
             print(f"  page {i}/{n} queued for OCR", flush=True)
 
         for future in as_completed(futures):
@@ -278,6 +305,15 @@ def main():
         default=WORKERS,
         help=f"Concurrent OCR requests for PDF pages (default: {WORKERS})",
     )
+    parser.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=180,
+        help="Max seconds of silence between streamed tokens before a page "
+        "request is abandoned (default: 180). Raise this if you run many "
+        "concurrent workers against one server, since per-request token "
+        "cadence drops as concurrency rises.",
+    )
     args = parser.parse_args()
 
     path: Path = args.input
@@ -291,7 +327,11 @@ def main():
     if suffix == ".pdf":
         try:
             result, raw_pages = process_pdf(
-                path, dpi=args.dpi, api_url=api_url, workers=args.workers
+                path,
+                dpi=args.dpi,
+                api_url=api_url,
+                workers=args.workers,
+                idle_timeout=args.idle_timeout,
             )
         except OcrPageError as e:
             print(f"{e} — aborting, no output written.", file=sys.stderr)
