@@ -96,7 +96,7 @@ wheels = [
 [[package]]
 name = "ultimate-ocr-wrapper"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "pymupdf" },
     { name = "requests" },

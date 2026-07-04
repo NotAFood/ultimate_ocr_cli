@@ -1,8 +1,10 @@
 import argparse
 import base64
 import json
+import os
 import re
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -11,7 +13,24 @@ import requests
 
 SERVER_IP = "localhost"
 PORT = "8001"
-API_URL = f"http://{SERVER_IP}:{PORT}/v1/chat/completions"
+WORKERS = 4
+
+
+def build_api_url(server_ip: str, port: str) -> str:
+    return f"http://{server_ip}:{port}/v1/chat/completions"
+
+
+API_URL = build_api_url(SERVER_IP, PORT)
+
+
+class OcrPageError(Exception):
+    """Raised when one or more pages fail OCR; the whole document is aborted."""
+
+    def __init__(self, failed_pages: list[int], total_pages: int):
+        self.failed_pages = failed_pages
+        self.total_pages = total_pages
+        pages = ", ".join(str(p) for p in failed_pages)
+        super().__init__(f"OCR failed on page(s) {pages} of {total_pages}")
 
 
 # Block types to drop entirely (repeated page furniture, no image data from vLLM)
@@ -128,7 +147,9 @@ def encode_image_bytes(image_bytes: bytes) -> str:
     return base64.b64encode(image_bytes).decode("utf-8")
 
 
-def query_ocr(base64_image: str, multi_page: bool = False) -> str | None:
+def query_ocr(
+    base64_image: str, multi_page: bool = False, api_url: str = API_URL
+) -> str | None:
     window_size = 1024 if multi_page else 128
     payload = {
         "model": "baidu/Unlimited-OCR",
@@ -155,7 +176,7 @@ def query_ocr(base64_image: str, multi_page: bool = False) -> str | None:
         },
     }
 
-    response = requests.post(API_URL, json=payload, timeout=120)
+    response = requests.post(api_url, json=payload, timeout=300)
     if response.status_code == 200:
         return response.json()["choices"][0]["message"]["content"]
     else:
@@ -163,43 +184,64 @@ def query_ocr(base64_image: str, multi_page: bool = False) -> str | None:
         return None
 
 
-def pdf_to_pages(pdf_path: Path, dpi: int = 150) -> list[bytes]:
+def process_pdf(
+    pdf_path: Path,
+    dpi: int = 150,
+    api_url: str = API_URL,
+    workers: int = WORKERS,
+) -> tuple[str, list[str]]:
+    """Return (cleaned_markdown, raw_pages) where raw_pages is one string per page.
+
+    Rendering and OCR are pipelined: each page is rasterized on the main thread
+    and its OCR request submitted to a worker pool immediately, so rendering page
+    i+1 overlaps with in-flight OCR calls for earlier pages. If any page fails,
+    remaining work is cancelled and the whole document is aborted (no partial
+    output) rather than returning a document with holes in it.
+    """
     doc = pymupdf.open(pdf_path)
-    pages = []
-    for page in doc:
+    n = len(doc)
+    print(f"Processing {n} page{'s' if n != 1 else ''} with {workers} worker{'s' if workers != 1 else ''}...")
+
+    raw_pages: list[str | None] = [None] * n
+    failed_pages: list[int] = []
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures: dict[Future, int] = {}
         mat = pymupdf.Matrix(dpi / 72, dpi / 72)
-        pix = page.get_pixmap(matrix=mat)
-        pages.append(pix.tobytes("jpeg"))
-    doc.close()
-    return pages
+        for i, page in enumerate(doc, 1):
+            print(f"  page {i}/{n} rendering...", flush=True)
+            page_bytes = page.get_pixmap(matrix=mat).tobytes("jpeg")
+            b64 = encode_image_bytes(page_bytes)
+            futures[pool.submit(query_ocr, b64, multi_page=(n > 1), api_url=api_url)] = i
+            print(f"  page {i}/{n} queued for OCR", flush=True)
+
+        for future in as_completed(futures):
+            page_num = futures[future]
+            text = future.result()
+            if text is None:
+                failed_pages.append(page_num)
+                print(f"  page {page_num}/{n} failed", file=sys.stderr, flush=True)
+                pool.shutdown(wait=False, cancel_futures=True)
+                break
+            raw_pages[page_num - 1] = text
+            print(f"  page {page_num}/{n} done", flush=True)
+    finally:
+        # wait=False: an in-flight requests.post() can't be cancelled and won't
+        # return until it times out. Don't block program exit on it — see the
+        # KeyboardInterrupt handler in main() for the other half of this.
+        pool.shutdown(wait=False, cancel_futures=True)
+        doc.close()
+
+    if failed_pages:
+        raise OcrPageError(sorted(failed_pages), n)
+
+    return clean_ocr("\n\n".join(raw_pages)), raw_pages  # type: ignore[arg-type]
 
 
-def process_pdf(pdf_path: Path, dpi: int = 150) -> tuple[str, list[str]]:
-    """Return (cleaned_markdown, raw_pages) where raw_pages is one string per page."""
-    print(f"Converting {pdf_path.name} to images at {dpi} DPI...")
-    pages = pdf_to_pages(pdf_path, dpi=dpi)
-    n = len(pages)
-    print(f"Processing {n} page{'s' if n != 1 else ''}...")
-
-    raw_pages: list[str] = []
-    for i, page_bytes in enumerate(pages, 1):
-        print(f"  OCR page {i}/{n}...", end=" ", flush=True)
-        b64 = encode_image_bytes(page_bytes)
-        text = query_ocr(b64, multi_page=(n > 1))
-        if text:
-            raw_pages.append(text)
-            print("done")
-        else:
-            raw_pages.append("")
-            print("failed")
-
-    return clean_ocr("\n\n".join(raw_pages)), raw_pages
-
-
-def process_image(image_path: Path) -> str | None:
+def process_image(image_path: Path, api_url: str = API_URL) -> str | None:
     with open(image_path, "rb") as f:
         b64 = encode_image_bytes(f.read())
-    raw = query_ocr(b64, multi_page=False)
+    raw = query_ocr(b64, multi_page=False, api_url=api_url)
     return clean_ocr(raw) if raw else None
 
 
@@ -222,6 +264,20 @@ def main():
         action="store_true",
         help="Generate self-contained HTML visualizer at <output>.html (implies --save-raw)",
     )
+    parser.add_argument(
+        "--server-ip",
+        default=SERVER_IP,
+        help=f"OCR server host/IP (default: {SERVER_IP})",
+    )
+    parser.add_argument(
+        "--port", default=PORT, help=f"OCR server port (default: {PORT})"
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=WORKERS,
+        help=f"Concurrent OCR requests for PDF pages (default: {WORKERS})",
+    )
     args = parser.parse_args()
 
     path: Path = args.input
@@ -229,9 +285,17 @@ def main():
         print(f"File not found: {path}", file=sys.stderr)
         sys.exit(1)
 
+    api_url = build_api_url(args.server_ip, args.port)
+
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        result, raw_pages = process_pdf(path, dpi=args.dpi)
+        try:
+            result, raw_pages = process_pdf(
+                path, dpi=args.dpi, api_url=api_url, workers=args.workers
+            )
+        except OcrPageError as e:
+            print(f"{e} — aborting, no output written.", file=sys.stderr)
+            sys.exit(1)
         if (args.save_raw or args.gen_viz) and args.output:
             raw_path = args.output.with_suffix(".pages.json")
             raw_path.write_text(
@@ -253,7 +317,7 @@ def main():
             )
     elif suffix in {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}:
         print(f"OCR-ing {path.name}...")
-        result = process_image(path)
+        result = process_image(path, api_url=api_url)
     else:
         print(f"Unsupported file type: {suffix}", file=sys.stderr)
         sys.exit(1)
@@ -271,4 +335,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Worker threads may be blocked inside a blocking requests.post() call,
+        # which can't be cancelled and keeps the interpreter alive at normal
+        # exit until it times out. Bypass that and exit immediately.
+        print("\nInterrupted.", file=sys.stderr)
+        os._exit(130)

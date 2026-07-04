@@ -16,3 +16,6 @@ samples/*.pages.json
 
 # macOS
 .DS_Store
+
+# pdf
+*.pdf
